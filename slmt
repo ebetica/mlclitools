@@ -1,0 +1,302 @@
+#!/usr/bin/env python
+import datetime
+import json
+import os
+import random
+import shlex
+import shutil
+import string
+import subprocess
+import sys
+import typing as T
+from pathlib import Path
+
+try:
+    import clize
+except ImportError:
+    raise ImportError("Please install clize with `pip install --user clize`")
+
+date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def split_shebang(lines):
+    if lines[0][:2] == "#!":
+        if len(lines) == 1:
+            raise RuntimeError("Script provided is empty, consisting of only a shebag!")
+        return [lines[0]], lines[1:]
+    else:
+        return None, lines
+
+
+def script_name():
+    return datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-") + "".join(
+        random.choice(string.ascii_letters) for _ in range(6)
+    )
+
+
+def job_id_string():
+    return '$([ -z "$SLURM_ARRAY_TASK_ID" ] && echo $SLURM_JOB_ID || echo ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}) '
+
+
+def config_home() -> Path:
+    value = os.environ.get("XDG_CONFIG_HOME")
+    if value and os.path.isabs(value):
+        return Path(value)
+    return Path(os.path.expandvars("$HOME")) / ".config"
+
+
+def read_write_config(force_write=False):
+    config_path = config_home() / "slmt"
+    if config_path.exists() and not force_write:
+        with config_path.open("r") as f:
+            return json.load(f)
+    else:
+        if config_path.exists():
+            with config_path.open("r") as f:
+                config = json.load(f)
+            default_out = config["out"]
+            default_scripts = config["scripts"]
+        else:
+            default_out = str(Path("~/slurm/out").expanduser().absolute())
+            default_scripts = str(Path("~/slurm/scripts").expanduser().absolute())
+        config = {
+            "out": input(f"Where to put slurm logs [default: {default_out}]: "),
+            "scripts": input(
+                f"Where to put slurm temporary scripts [default: {default_scripts}]: "
+            ),
+        }
+        if config["out"] == "":
+            config["out"] = default_out
+        if config["scripts"] == "":
+            config["scripts"] = default_scripts
+        with config_path.open("w") as f:
+            json.dump(config, f)
+        return config
+
+
+def run(
+    *cmd: str,
+    display: bool = False,
+    local: bool = False,
+    script: str = None,
+    retry: bool = False,
+    image: str = None,
+    slurm_flags: str = "",
+    srun: bool = False,
+) -> str:
+    """Slurm Tools: Run a script on your favorite slurm cluster
+
+    Try: `slmt run --slurm-flags "-t 1-0 -c1" -- python myscript.py --my-arg 5`
+
+    You can also use `-` as in the input argument, in which case slmt run will
+    grab arguments directly from stdin, e.g. ::
+
+        echo "python myscript.py --my-arg 5" | slmt run --slurm-flags "-t 1-0 -c1"
+
+    Nothing is escaped in pipe mode, and script mode
+
+    shlex.quote is run on each argument in argument mode.
+    In argument mode, you can prepend stuff with \$ to make it not escape.
+    This is super useful when you want the command to actually contain a envvar, e.g. ::
+
+        slmt run --slurm-flags "--array 0-10" -- echo \$"id=\$SLURM_ARRAY_TASK_ID"
+
+    :param cmd: arguments to pass along to slurm
+    :param display: Just print the thing you want to run
+    :param local: Run it without slurm nonsense
+    :param script: Path to a script to run instead of args
+    :param retry: retry on timeout, preemption, with the exact same command
+    :param image: Chance working directory to a squashfs extracted image.
+    :param slurm_flags: args to pass along to slurm
+    :param srun: run your script with `srun script`, this is necessary for multinode jobs.
+    """
+
+    if script:
+        with open(script, "r") as f:
+            s = f.readlines()
+    elif cmd == ("-",):
+        s = sys.stdin.readlines()
+    else:
+        s = [" ".join((shlex.quote(x) if x[0] != "$" else x[1:]) for x in cmd)]
+
+    config = read_write_config()
+    out_path = Path(config["out"]) / date
+    script_base = Path(config["scripts"]) / date / script_name()
+    sbatch_path = script_base.with_suffix(".sbatch")
+    script_path = script_base.with_suffix(".sh")
+    script_db = Path(config["scripts"]) / ".slmt.db"
+    script_db.touch()
+
+    out_path.mkdir(parents=True, exist_ok=True)
+    sbatch_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not local:
+        if not ("-o" in slurm_flags or "--output" in slurm_flags):
+            out_path.mkdir(parents=True, exist_ok=True)
+            print(f"Output at {out_path}", file=sys.stderr)
+        out_path = out_path / (
+            "slurm-%A_%a.out"
+            if "--array " in slurm_flags or "-a " in slurm_flags
+            else "slurm-%j.out"
+        )
+        slurm_flags = (
+            f"--signal B:USR2@60 --open-mode=append -o {out_path} " + slurm_flags
+        )
+
+    s = [x.strip() for x in s]
+    shebang, rest = split_shebang(s)
+    if shebang is None:
+        shebang = ["#!/bin/bash"]
+    s = "\n".join(shebang + rest)
+    if display:
+        return s
+        sys.exit(0)
+    with open(script_path, "w") as f:
+        f.write(s)
+    os.chmod(script_path, 0o777)
+
+    real_out_path = (
+        str(out_path)
+        .replace("%j", "${SLURM_JOB_ID}")
+        .replace("%A", "${SLURM_ARRAY_JOB_ID}")
+        .replace("%a", "${SLURM_ARRAY_TASK_ID}")
+    )
+    batch = []
+    batch.append(f"#!/usr/bin/env bash")
+    batch.append(f"#SBATCH {slurm_flags}")
+    batch.append("")
+    batch.append("# Recording script into database...")
+    batch.append(
+        "[[ -v SLURM_JOB_ID ]] && ("
+        f"flock 200 || exit 1; "
+        f'LINE="{job_id_string()} {script_base} {real_out_path}"; '
+        f'[[ "$LINE" != "$(tail -n1 {script_db})" ]] && echo "$LINE" >> {script_db}; '
+        f") 200>{script_db}.lock"
+    )
+
+    batch.append("env | grep ^SLURM_")
+    batch.append('echo "Running script at {}"'.format(script_path))
+    batch.append('echo "With batch script at {}"'.format(sbatch_path))
+
+    if image is not None:
+        batch += [
+            f'echo "Using image file at {image}"',
+            'CWD="$(mktemp -d)"',
+            f'unsquashfs -f -d "$CWD" {image}',
+            'cd "$CWD"',
+        ]
+    if retry:
+        batch.append("SLMT_TRAP_FN() {")
+        batch.append("echo Trapped: restarting")
+        batch.append(f"scontrol requeue {job_id_string()}")
+        batch.append("}")
+        batch.append("trap SLMT_TRAP_FN USR2")
+
+    batch.append("")
+    batch.append(f"{'srun' if not local else ''} {script_path} & wait")
+
+    with open(sbatch_path, "w") as f:
+        f.write("\n".join(batch))
+    os.chmod(sbatch_path, 0o777)
+    return str(sbatch_path)
+
+
+def dbind(jobid: str, ind: int, suffix=""):
+    config = read_write_config()
+    script_db = Path(config["scripts"]) / ".slmt.db"
+    script_db.touch()
+    try:
+        output = (
+            subprocess.check_output(["grep", f"^{jobid} ", script_db])
+            .decode()
+            .strip()
+            .splitlines()
+        )
+    except subprocess.CalledProcessError as e:
+        output = []
+
+    if len(output) == 0:
+        print(f"{jobid} not in database :(", file=sys.stderr)
+    if len(output) > 1:
+        print(f"Multiple ids match. This is a bug.", file=sys.stderr)
+    for line in output:
+        print(line.split()[ind] + suffix)
+
+
+def logof(jobid: str):
+    dbind(jobid, -1)
+
+
+def scriptof(jobid: str):
+    dbind(jobid, 1, ".sbatch")
+
+
+def mkimg(
+    *find_arguments,
+    e: str,
+    ignore: str = "",
+    extra_find_filter: str = None,
+    dest: str = ".code_snapshots",
+    sqsh: bool = False,
+):
+    """Archives your current directory
+
+    Try: `slmt mkimg -e py,sh,so --sqsh`
+
+    :param find_arguments: extra arguments to the find command, read the source to learn what it is
+    :param e: file types to archive
+    :param extra-find-filter: Extra filters to pass to find, e.g. "-name 'include_my_file'"
+    :param ignore: Specific directories to ignore, can be regexes, comma seperated
+    :param dest: Where to save outputs to
+    :param sqsh: Output a squashfs instead
+    """
+    e = e.replace(",", "|")
+    filt = "-o " + extra_find_filter if extra_find_filter is not None else ""
+    ignore_filter = " ".join(
+        [f"-not -path '*{x}/*'" for x in ignore.split(",") if x != ""]
+    )
+    find_extra = " ".join((shlex.quote(x)) for x in find_arguments)
+    saveloc = (
+        subprocess.check_output(
+            f"find . -regextype posix-extended "
+            f"\\( -regex '.*\\.({e})' -type f -o -type l {filt} \\) {ignore_filter} -not -path '*/\\.*' {find_extra}"
+            f"| tar -c -T - -f - | "
+            f'(DN="{dest}/$(date -Iseconds)"; mkdir -p $DN; tar -x -C $DN; echo $DN)',
+            shell=True,
+        )
+        .decode()
+        .strip()
+    )
+    if sqsh:
+        sqshloc = saveloc + ".sqsh"
+        FNULL = open(os.devnull, "w")
+        subprocess.check_call(
+            ["mksquashfs", saveloc, sqshloc], stdout=FNULL, stderr=FNULL
+        )
+        try:
+            relative = Path(saveloc).relative_to(Path(dest))
+            shutil.rmtree(saveloc)
+        except ValueError:
+            raise RuntimeError(
+                f"{saveloc} is not under {dest}, not removing after squashing"
+            )
+        return sqshloc
+    else:
+        return saveloc
+
+
+def config():
+    """Rewrites configuration. Run this on first use"""
+    read_write_config(True)
+
+
+if __name__ == "__main__":
+    clize.run(
+        [run, mkimg, config, logof, scriptof],
+        description="""Pipe output to bash!
+
+    This tool is a small script to handle slurm submission, arrays,
+    retrying, and archiving of your code in a self contained script.
+
+    """,
+    )
