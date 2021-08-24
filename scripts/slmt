@@ -82,7 +82,7 @@ def run(
     retry: bool = False,
     image: str = None,
     slurm_flags: str = "",
-    srun: bool = False,
+    srun: bool = True,
 ) -> str:
     """Slurm Tools: Run a script on your favorite slurm cluster
 
