@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import datetime
 import json
 import os
@@ -147,10 +147,18 @@ def run(
     shebang, rest = split_shebang(s)
     if shebang is None:
         shebang = ["#!/bin/bash"]
+    if image is not None:
+        rest = [
+            f'echo "Using image file at {image}"',
+            'CWD="$(mktemp -d)"',
+            f'unsquashfs -f -d "$CWD" {image}',
+            'cd "$CWD"',
+        ] + rest
     s = "\n".join(shebang + rest)
     if display:
         return s
         sys.exit(0)
+
     with open(script_path, "w") as f:
         f.write(s)
     os.chmod(script_path, 0o777)
@@ -178,13 +186,6 @@ def run(
     batch.append('echo "Running script at {}"'.format(script_path))
     batch.append('echo "With batch script at {}"'.format(sbatch_path))
 
-    if image is not None:
-        batch += [
-            f'echo "Using image file at {image}"',
-            'CWD="$(mktemp -d)"',
-            f'unsquashfs -f -d "$CWD" {image}',
-            'cd "$CWD"',
-        ]
     if retry:
         batch.append("SLMT_TRAP_FN() {")
         batch.append("echo Trapped: restarting")
