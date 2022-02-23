@@ -81,6 +81,7 @@ def run(
     script: str = None,
     retry: bool = False,
     image: str = None,
+    tmpdir: str = None,
     slurm_flags: str = "",
     srun: bool = True,
 ) -> str:
@@ -140,7 +141,8 @@ def run(
             else "slurm-%j.out"
         )
         slurm_flags = (
-            f"--signal B:USR2@60 --open-mode=append -o {out_path} " + slurm_flags
+            f"--signal B:USR2@60 --requeue --open-mode=append -o {out_path} "
+            + slurm_flags
         )
 
     s = [x.strip() for x in s]
@@ -148,9 +150,11 @@ def run(
     if shebang is None:
         shebang = ["#!/bin/bash"]
     if image is not None:
+        tmpdir = "" if tmpdir is None else f"-p {tmpdir}"
+        image = Path(image).absolute()
         rest = [
-            f'echo "Using image file at {image}"',
-            'CWD="$(mktemp -d)"',
+            f'CWD="$(mktemp -d {tmpdir})"',
+            f'echo "Using image file at {image} in directory ${{CWD}}"',
             f'unsquashfs -f -d "$CWD" {image}',
             'cd "$CWD"',
         ] + rest
@@ -218,8 +222,6 @@ def dbind(jobid: str, ind: int, suffix=""):
 
     if len(output) == 0:
         print(f"{jobid} not in database :(", file=sys.stderr)
-    if len(output) > 1:
-        print(f"Multiple ids match. This is a bug.", file=sys.stderr)
     for line in output:
         print(line.split()[ind] + suffix)
 
