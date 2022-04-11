@@ -227,10 +227,12 @@ def dbind(jobid: str, ind: int, suffix=""):
 
 
 def logof(jobid: str):
+    """Prints the location of the log of the job, keyed by jobid."""
     dbind(jobid, -1)
 
 
 def scriptof(jobid: str):
+    """Prints the location of the script of the job, keyed by jobid."""
     dbind(jobid, 1, ".sbatch")
 
 
