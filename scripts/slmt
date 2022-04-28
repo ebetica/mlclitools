@@ -71,6 +71,8 @@ def read_write_config(force_write=False):
             config["scripts"] = default_scripts
         with config_path.open("w") as f:
             json.dump(config, f)
+        Path(config["out"]).mkdir(parents=True, exist_ok=True)
+        Path(config["scripts"]).mkdir(parents=True, exist_ok=True)
         return config
 
 
